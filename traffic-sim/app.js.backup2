@@ -1,0 +1,488 @@
+'use strict';
+
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const WebSocket = require('ws');
+const { Gateway, Wallets } = require('fabric-network');
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const PORT = 3000;
+
+// Enable CORS
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Traffic light state machine configuration
+const YELLOW_DURATION = 3;
+const ALL_RED_DURATION = 2;
+const DEFAULT_GREEN_DURATION = 60;
+
+// Global state for all intersections
+const intersections = {
+    A: createIntersectionState('A'),
+    B: createIntersectionState('B'),
+    C: createIntersectionState('C')
+};
+
+function createIntersectionState(id) {
+    return {
+        id,
+        currentPhase: null,
+        targetPhase: null,
+        state: 'RED',
+        timeRemaining: 0,
+        lastUpdate: Date.now(),
+        inTransition: false,
+        greenDuration: DEFAULT_GREEN_DURATION,
+        densityNS: 50,
+        densityEW: 50,
+        decision: null
+    };
+}
+
+// Fabric connection
+let globalGateway;
+let globalContract;
+
+async function connect() {
+    let gateway;
+    try {
+        console.log('🔗 Connecting to Fabric network...');
+
+        const ccpPath = path.resolve(__dirname, 'connection-full.json');
+        if (!fs.existsSync(ccpPath)) {
+            throw new Error('Connection profile not found at ' + ccpPath);
+        }
+
+        const ccp = JSON.parse(fs.readFileSync(ccpPath, 'utf8'));
+
+        const walletPath = path.join(process.cwd(), 'wallet');
+        if (!fs.existsSync(walletPath)) {
+            fs.mkdirSync(walletPath, { recursive: true });
+            console.log('📁 Created wallet directory');
+        }
+
+        const wallet = await Wallets.newFileSystemWallet(walletPath);
+        const identityName = 'appUser';
+
+        console.log(`🔍 Checking for identity: ${identityName}`);
+        const identity = await wallet.get(identityName);
+        if (!identity) {
+            console.error(`❌ Identity ${identityName} not found in wallet`);
+            console.log('💡 Please run: node enrollAdmin.js && node registerUser.js');
+            process.exit(1);
+        }
+
+        console.log('✅ Identity found, connecting to gateway...');
+        gateway = new Gateway();
+
+        process.env.GRPC_SSL_CIPHER_SUITES = 'HIGH+ECDSA';
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+        await gateway.connect(ccp, {
+            wallet,
+            identity: identityName,
+            discovery: {
+                enabled: false,
+                asLocalhost: true
+            },
+            eventHandlerOptions: {
+                commitTimeout: 300,
+                strategy: null
+            }
+        });
+
+        console.log('✅ Connected to gateway, getting network...');
+        const network = await gateway.getNetwork('mychannel');
+        console.log('✅ Connected to channel: mychannel');
+
+        contract = network.getContract('traffic'); // Assign to global variable
+        console.log('✅ Contract traficCC loaded');
+
+        return { gateway, contract, network };
+
+    } catch (error) {
+        console.error('❌ Failed to connect to Fabric network:');
+        console.error(error.message);
+
+        if (gateway) {
+            gateway.disconnect();
+        }
+        delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+        process.exit(1);
+    }
+}
+
+async function initLedger(contract) {
+    try {
+        console.log('📄 Initializing ledger...');
+        await contract.submitTransaction('InitLedger');
+        console.log('✅ Ledger initialized');
+    } catch (err) {
+        console.log('⚠️ Ledger initialization skipped:', err.message);
+    }
+}
+
+// WebSocket connection handler
+wss.on('connection', (ws) => {
+    console.log('🔌 Frontend connected via WebSocket');
+
+    // Send current state immediately
+    ws.send(JSON.stringify({
+        type: 'INITIAL_STATE',
+        data: intersections
+    }));
+
+    ws.on('message', async (message) => {
+        try {
+            const msg = JSON.parse(message);
+
+            if (msg.type === 'UPDATE_DENSITY') {
+                const { intersectionId, direction, density } = msg.data;
+                
+                if (intersections[intersectionId]) {
+                    if (direction === 'NS') {
+                        intersections[intersectionId].densityNS = density;
+                    } else if (direction === 'EW') {
+                        intersections[intersectionId].densityEW = density;
+                    }
+
+                    // Submit to blockchain
+                    if (globalContract) {
+                        const sensorData = JSON.stringify({ density });
+                        await globalContract.submitTransaction(
+                            'SubmitSensorData',
+                            intersectionId,
+                            direction,
+                            sensorData
+                        );
+                        console.log(`✅ [${intersectionId}] Submitted ${direction} density: ${density}`);
+                    }
+
+                    // Broadcast update to all clients
+                    broadcastState();
+                }
+            }
+        } catch (err) {
+            console.error('Error handling WebSocket message:', err);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('🔌 Frontend disconnected');
+    });
+});
+
+function broadcastState() {
+    const message = JSON.stringify({
+        type: 'STATE_UPDATE',
+        data: intersections,
+        timestamp: Date.now()
+    });
+
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
+
+// State machine update loop (runs every 100ms)
+function startStateMachine() {
+    setInterval(() => {
+        let stateChanged = false;
+
+        Object.keys(intersections).forEach(id => {
+            const state = intersections[id];
+            const now = Date.now();
+            const elapsed = (now - state.lastUpdate) / 1000;
+
+            state.timeRemaining = Math.max(0, state.timeRemaining - elapsed);
+            state.lastUpdate = now;
+
+            // Handle blockchain decision
+            if (state.decision) {
+                const blockchainPhase = state.decision.phase;
+                const blockchainDuration = state.decision.greenDuration || DEFAULT_GREEN_DURATION;
+
+                if (blockchainPhase !== state.targetPhase && !state.inTransition) {
+                    console.log(`[${id}] 🆕 New phase: ${blockchainPhase} (${blockchainDuration}s)`);
+
+                    state.targetPhase = blockchainPhase;
+                    state.greenDuration = blockchainDuration;
+
+                    if (state.currentPhase && state.currentPhase !== blockchainPhase) {
+                        if (state.state === 'GREEN_NS' || state.state === 'GREEN_EW') {
+                            state.inTransition = true;
+                            state.state = state.currentPhase === 'NS' ? 'YELLOW_NS' : 'YELLOW_EW';
+                            state.timeRemaining = YELLOW_DURATION;
+                            stateChanged = true;
+                        }
+                    } else if (!state.currentPhase) {
+                        state.currentPhase = blockchainPhase;
+                        state.state = blockchainPhase === 'NS' ? 'GREEN_NS' : 'GREEN_EW';
+                        state.timeRemaining = blockchainDuration;
+                        stateChanged = true;
+                    }
+                }
+            }
+
+            // State transitions
+            if (state.timeRemaining <= 0) {
+                switch (state.state) {
+                    case 'GREEN_NS':
+                    case 'GREEN_EW':
+                        state.state = state.state === 'GREEN_NS' ? 'YELLOW_NS' : 'YELLOW_EW';
+                        state.timeRemaining = YELLOW_DURATION;
+                        state.inTransition = true;
+                        stateChanged = true;
+                        break;
+
+                    case 'YELLOW_NS':
+                    case 'YELLOW_EW':
+                        state.state = state.state === 'YELLOW_NS' ? 'ALL_RED_TO_EW' : 'ALL_RED_TO_NS';
+                        state.timeRemaining = ALL_RED_DURATION;
+                        stateChanged = true;
+                        break;
+
+                    case 'ALL_RED_TO_EW':
+                    case 'ALL_RED_TO_NS':
+                        const newPhase = state.state === 'ALL_RED_TO_EW' ? 'EW' : 'NS';
+                        state.currentPhase = newPhase;
+                        state.state = newPhase === 'NS' ? 'GREEN_NS' : 'GREEN_EW';
+                        state.timeRemaining = state.greenDuration;
+                        state.inTransition = false;
+                        stateChanged = true;
+                        break;
+                }
+            }
+        });
+
+        // Broadcast state if changed
+        if (stateChanged) {
+            broadcastState();
+        }
+    }, 100);
+
+    console.log('🎬 State machine started (100ms interval)');
+}
+
+// Blockchain decision polling (every 60s)
+async function startBlockchainPolling(contract) {
+    setInterval(async () => {
+        for (const id of Object.keys(intersections)) {
+            try {
+                const densityNS = intersections[id].densityNS;
+                const densityEW = intersections[id].densityEW;
+
+                console.log(`\n🚦 [${id}] NS density = ${densityNS}, EW density = ${densityEW}`);
+
+                const sensorNS = JSON.stringify({ density: densityNS });
+                await contract.submitTransaction('SubmitSensorData', id, 'NS', sensorNS);
+
+                const sensorEW = JSON.stringify({ density: densityEW });
+                await contract.submitTransaction('SubmitSensorData', id, 'EW', sensorEW);
+
+                const decisionResult = await contract.submitTransaction('ComputeDecision', id);
+                const decision = JSON.parse(decisionResult.toString());
+
+                intersections[id].decision = decision;
+                intersections[id].densityNS = decision.densityNS;
+                intersections[id].densityEW = decision.densityEW;
+
+                console.log(`🟢 [${id}] Phase: ${decision.phase}, Duration: ${decision.greenDuration}s`);
+                console.log(`   Reason: ${decision.algorithmReason}`);
+
+            } catch (err) {
+                console.error(`❌ Blockchain error for ${id}:`, err.message);
+            }
+        }
+
+        broadcastState();
+        console.log('\n⏰ Next blockchain decision in 60s...');
+    }, 60000);
+
+    console.log('⛓️ Blockchain polling started (60s interval)');
+}
+
+// REST API endpoints
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+app.get('/api/decisions', (req, res) => {
+    const decisions = {};
+    Object.keys(intersections).forEach(id => {
+        decisions[id] = intersections[id].decision || {};
+    });
+    res.json(decisions);
+});
+
+app.get('/api/state', (req, res) => {
+    res.json(intersections);
+});
+
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'OK',
+        timestamp: new Date().toISOString(),
+        service: 'Traffic Simulation App',
+        websocketClients: wss.clients.size
+    });
+});
+
+// Start server
+server.listen(PORT, async () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`🔌 WebSocket server ready on ws://localhost:${PORT}`);
+    console.log('🔧 Starting Fabric connection...');
+
+    try {
+        const { gateway, contract } = await connect();
+        globalGateway = gateway;
+        globalContract = contract;
+
+        console.log('🎯 Connected to Fabric network successfully!');
+
+        await initLedger(contract);
+        startStateMachine();
+        await startBlockchainPolling(contract);
+
+        process.on('SIGINT', async () => {
+            console.log('\n🛑 Shutting down...');
+            wss.close();
+            delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+            if (globalGateway) {
+                globalGateway.disconnect();
+            }
+            process.exit(0);
+        });
+
+    } catch (error) {
+        console.error('💥 Failed to start application:', error);
+        delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+        process.exit(1);
+    }
+});
+
+// ========================================
+// EMERGENCY VEHICLE ENDPOINTS
+// ========================================
+
+// Submit emergency vehicle request
+app.post('/api/emergency/:intersectionId', async (req, res) => {
+    try {
+        const { intersectionId } = req.params;
+        const { direction, vehicleType, vehicleId } = req.body;
+
+        if (!['NS', 'EW'].includes(direction)) {
+            return res.status(400).json({ error: 'Direction must be NS or EW' });
+        }
+
+        if (!['AMBULANCE', 'FIRE_TRUCK', 'POLICE'].includes(vehicleType)) {
+            return res.status(400).json({ error: 'Invalid vehicle type' });
+        }
+
+        console.log(`🚨 Emergency request: ${vehicleType} at intersection ${intersectionId} direction ${direction}`);
+
+        const result = await contract.submitTransaction(
+            'SubmitEmergencyRequest',
+            intersectionId,
+            direction,
+            vehicleId || `EMG_${Date.now()}`,
+            vehicleType
+        );
+
+        const emergencyKey = result.toString();
+
+        // Broadcast emergency to all WebSocket clients
+        wss.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                    type: 'EMERGENCY_ALERT',
+                    data: {
+                        intersectionId,
+                        direction,
+                        vehicleType,
+                        emergencyKey,
+                        timestamp: new Date().toISOString()
+                    }
+                }));
+            }
+        });
+
+        // Force immediate decision computation
+        await contract.submitTransaction('ComputeDecision', intersectionId);
+        await updateIntersectionState(intersectionId);
+
+        res.json({
+            success: true,
+            emergencyKey,
+            message: `Emergency vehicle ${vehicleType} priority activated`
+        });
+    } catch (error) {
+        console.error('❌ Emergency request failed:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get active emergencies
+app.get('/api/emergency/:intersectionId/active', async (req, res) => {
+    try {
+        const { intersectionId } = req.params;
+        const result = await contract.evaluateTransaction('GetActiveEmergencies', intersectionId);
+        const emergencies = JSON.parse(result.toString());
+        res.json(emergencies);
+    } catch (error) {
+        console.error('❌ Failed to get active emergencies:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Clear emergency request
+app.post('/api/emergency/clear/:emergencyKey', async (req, res) => {
+    try {
+        const { emergencyKey } = req.params;
+        console.log(`✅ Clearing emergency: ${emergencyKey}`);
+
+        const result = await contract.submitTransaction('ClearEmergencyRequest', emergencyKey);
+        const clearedEmergency = JSON.parse(result.toString());
+
+        res.json({
+            success: true,
+            emergency: clearedEmergency
+        });
+    } catch (error) {
+        console.error('❌ Failed to clear emergency:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get emergency history
+app.get('/api/emergency/:intersectionId/history', async (req, res) => {
+    try {
+        const { intersectionId } = req.params;
+        const { startTime, endTime } = req.query;
+
+        const result = await contract.evaluateTransaction(
+            'GetEmergencyHistory',
+            intersectionId,
+            startTime || '',
+            endTime || ''
+        );
+
+        const history = JSON.parse(result.toString());
+        res.json(history);
+    } catch (error) {
+        console.error('❌ Failed to get emergency history:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+console.log('🚨 Emergency vehicle endpoints registered');

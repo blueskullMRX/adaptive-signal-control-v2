@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Traffic Management System</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚦 Smart Traffic Management System</h1>
+            <p class="subtitle">Blockchain-Powered Adaptive Traffic Control</p>
+            <div class="status-badge">
+                <span id="status-indicator" class="status-dot"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+        </header>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">📊</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="total-decisions">0</div>
+                    <div class="stat-label">Total Decisions</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">⏱️</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="avg-duration">0s</div>
+                    <div class="stat-label">Avg Green Duration</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">🚗</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="avg-density">0</div>
+                    <div class="stat-label">Avg Traffic Density</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">🔄</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="phase-switches">0</div>
+                    <div class="stat-label">Phase Switches</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="intersections-grid">
+            <div class="intersection-card" id="intersection-A">
+                <div class="intersection-header">
+                    <h2>Intersection A</h2>
+                    <div class="phase-indicator" id="phase-A">
+                        <span class="phase-badge">--</span>
+                    </div>
+                </div>
+                <div class="traffic-light" id="light-A">
+                    <div class="light red"></div>
+                    <div class="light yellow"></div>
+                    <div class="light green"></div>
+                </div>
+                <div class="intersection-data">
+                    <div class="data-row">
+                        <span class="data-label">NS Density:</span>
+                        <span class="data-value" id="ns-density-A">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">EW Density:</span>
+                        <span class="data-value" id="ew-density-A">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">Green Duration:</span>
+                        <span class="data-value" id="duration-A">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">Priority:</span>
+                        <span class="priority-badge" id="priority-A">--</span>
+                    </div>
+                </div>
+                <div class="algorithm-reason" id="reason-A">
+                    <small>Waiting for data...</small>
+                </div>
+            </div>
+
+            <div class="intersection-card" id="intersection-B">
+                <div class="intersection-header">
+                    <h2>Intersection B</h2>
+                    <div class="phase-indicator" id="phase-B">
+                        <span class="phase-badge">--</span>
+                    </div>
+                </div>
+                <div class="traffic-light" id="light-B">
+                    <div class="light red"></div>
+                    <div class="light yellow"></div>
+                    <div class="light green"></div>
+                </div>
+                <div class="intersection-data">
+                    <div class="data-row">
+                        <span class="data-label">NS Density:</span>
+                        <span class="data-value" id="ns-density-B">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">EW Density:</span>
+                        <span class="data-value" id="ew-density-B">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">Green Duration:</span>
+                        <span class="data-value" id="duration-B">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">Priority:</span>
+                        <span class="priority-badge" id="priority-B">--</span>
+                    </div>
+                </div>
+                <div class="algorithm-reason" id="reason-B">
+                    <small>Waiting for data...</small>
+                </div>
+            </div>
+
+            <div class="intersection-card" id="intersection-C">
+                <div class="intersection-header">
+                    <h2>Intersection C</h2>
+                    <div class="phase-indicator" id="phase-C">
+                        <span class="phase-badge">--</span>
+                    </div>
+                </div>
+                <div class="traffic-light" id="light-C">
+                    <div class="light red"></div>
+                    <div class="light yellow"></div>
+                    <div class="light green"></div>
+                </div>
+                <div class="intersection-data">
+                    <div class="data-row">
+                        <span class="data-label">NS Density:</span>
+                        <span class="data-value" id="ns-density-C">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">EW Density:</span>
+                        <span class="data-value" id="ew-density-C">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">Green Duration:</span>
+                        <span class="data-value" id="duration-C">--</span>
+                    </div>
+                    <div class="data-row">
+                        <span class="data-label">Priority:</span>
+                        <span class="priority-badge" id="priority-C">--</span>
+                    </div>
+                </div>
+                <div class="algorithm-reason" id="reason-C">
+                    <small>Waiting for data...</small>
+                </div>
+            </div>
+        </div>
+
+        <div class="activity-log">
+            <h3>📝 Recent Activity</h3>
+            <div id="activity-feed" class="activity-feed"></div>
+        </div>
+    </div>
+
+    <script src="app-client.js"></script>
+</body>
+</html>
