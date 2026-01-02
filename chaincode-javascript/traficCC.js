@@ -199,8 +199,19 @@ class TrafficContract extends Contract {
         }
         else if (!lastPhase) {
             currentPhase = densityNS >= densityEW ? 'NS' : 'EW';
-            greenDuration = 60;
-            reason = 'Initial phase selection based on density';
+            
+            // Apply adaptive algorithm even for initial phase
+            const activeDensity = currentPhase === 'NS' ? densityNS : densityEW;
+            const waitingDensity = currentPhase === 'NS' ? densityEW : densityNS;
+            const totalDensity = densityNS + densityEW || 1;
+            
+            const ratio = activeDensity / totalDensity;
+            const baseDuration = 30 + (ratio * 70);
+            const waitingRatio = waitingDensity / totalDensity;
+            const waitingBonus = waitingRatio * 20;
+            
+            greenDuration = Math.round(Math.min(120, baseDuration + waitingBonus));
+            reason = `Initial phase selection: ${currentPhase} (NS=${densityNS}, EW=${densityEW})`;
         } else {
             const txTimestamp = ctx.stub.getTxTimestamp();
             const now = txTimestamp.seconds.low * 1000;
@@ -225,12 +236,18 @@ class TrafficContract extends Contract {
             }
 
             const activeDensity = currentPhase === 'NS' ? densityNS : densityEW;
+            const waitingDensity = currentPhase === 'NS' ? densityEW : densityNS;
             const totalDensity = densityNS + densityEW || 1;
-            const baseDuration = 60;
-            greenDuration = Math.max(20, Math.min(120,
-                baseDuration * (activeDensity / totalDensity) + 20
-            ));
-            greenDuration = Math.round(greenDuration);
+
+            // Hybrid Weighted + Waiting Time Algorithm
+            const ratio = activeDensity / totalDensity;
+            const baseDuration = 30 + (ratio * 70); // 30-100s based on ratio
+
+            // Add waiting bonus for other direction
+            const waitingRatio = waitingDensity / totalDensity;
+            const waitingBonus = waitingRatio * 20; // Up to +20s
+
+            greenDuration = Math.round(Math.min(120, baseDuration + waitingBonus));
         }
 
         const txTimestamp = ctx.stub.getTxTimestamp();

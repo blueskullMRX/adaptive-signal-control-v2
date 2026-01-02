@@ -104,7 +104,7 @@ async function connect() {
         const network = await gateway.getNetwork('mychannel');
         console.log('✅ Connected to channel: mychannel');
 
-        globalContract = network.getContract('traffic'); // Assign to global variable
+        globalContract = network.getContract('traffic');
         console.log('✅ Contract traficCC loaded');
 
         return { gateway, contract: globalContract, network };
@@ -150,22 +150,27 @@ wss.on('connection', (ws) => {
                 const { intersectionId, direction, density } = msg.data;
                 
                 if (intersections[intersectionId]) {
+                    // Update local state
                     if (direction === 'NS') {
                         intersections[intersectionId].densityNS = density;
                     } else if (direction === 'EW') {
                         intersections[intersectionId].densityEW = density;
                     }
 
-                    // Submit to blockchain
+                    // Submit to blockchain IMMEDIATELY for this sensor
                     if (globalContract) {
-                        const sensorData = JSON.stringify({ density });
-                        await globalContract.submitTransaction(
-                            'SubmitSensorData',
-                            intersectionId,
-                            direction,
-                            sensorData
-                        );
-                        console.log(`✅ [${intersectionId}] Submitted ${direction} density: ${density}`);
+                        try {
+                            const sensorData = JSON.stringify({ density });
+                            await globalContract.submitTransaction(
+                                'SubmitSensorData',
+                                intersectionId,
+                                direction,
+                                sensorData
+                            );
+                            console.log(`✅ [${intersectionId}] ${direction} sensor updated: ${density}`);
+                        } catch (err) {
+                            console.error(`❌ [${intersectionId}] Failed to submit ${direction} sensor:`, err.message);
+                        }
                     }
 
                     // Broadcast update to all clients
@@ -209,8 +214,6 @@ function startStateMachine() {
             state.timeRemaining = Math.max(0, state.timeRemaining - elapsed);
             state.lastUpdate = now;
 
-            // Handle blockchain decision
-            
             // EMERGENCY INTERRUPT: Force immediate transition if emergency detected
             if (state.decision && state.decision.isEmergency && !state.emergencyOverride) {
                 const emergencyPhase = state.decision.phase;
@@ -292,22 +295,19 @@ function startStateMachine() {
     console.log('🎬 State machine started (100ms interval)');
 }
 
-// Blockchain decision polling (every 60s)
+// Blockchain decision polling (every 60s) - Only computes decisions, sensor data already submitted
 async function startBlockchainPolling(contract) {
     setInterval(async () => {
+        console.log('\n⏱️  Computing traffic decisions from blockchain...');
+        
         for (const id of Object.keys(intersections)) {
             try {
                 const densityNS = intersections[id].densityNS;
                 const densityEW = intersections[id].densityEW;
 
-                console.log(`\n🚦 [${id}] NS density = ${densityNS}, EW density = ${densityEW}`);
+                console.log(`🚦 [${id}] Current density: NS=${densityNS}, EW=${densityEW}`);
 
-                const sensorNS = JSON.stringify({ density: densityNS });
-                await globalContract.submitTransaction('SubmitSensorData', id, 'NS', sensorNS);
-
-                const sensorEW = JSON.stringify({ density: densityEW });
-                await globalContract.submitTransaction('SubmitSensorData', id, 'EW', sensorEW);
-
+                // Only compute decision - sensor data already submitted via WebSocket
                 const decisionResult = await globalContract.submitTransaction('ComputeDecision', id);
                 const decision = JSON.parse(decisionResult.toString());
 
@@ -327,7 +327,8 @@ async function startBlockchainPolling(contract) {
         console.log('\n⏰ Next blockchain decision in 60s...');
     }, 60000);
 
-    console.log('⛓️ Blockchain polling started (60s interval)');
+    console.log('⛓️  Blockchain decision polling started (60s interval)');
+    console.log('📡 Sensor data submitted immediately via WebSocket updates');
 }
 
 // REST API endpoints
@@ -374,29 +375,28 @@ server.listen(PORT, async () => {
         process.on('SIGINT', async () => {
             console.log('\n🛑 Shutting down...');
             
-        // Clear all active emergencies before shutdown
-        console.log('🧹 Clearing active emergencies...');
-        try {
-            for (const intersectionId of Object.keys(intersections)) {
-                const result = await globalContract.evaluateTransaction('GetActiveEmergencies', intersectionId);
-                const emergencies = JSON.parse(result.toString());
-                
-                for (const emergency of emergencies) {
-                    try {
-                        const emergencyKey = emergency.Key || emergency.key || emergency;
-                        await globalContract.submitTransaction('ClearEmergencyRequest', emergencyKey);
-                        console.log(`✅ Cleared emergency: ${emergencyKey}`);
-                    } catch (err) {
-                        console.error(`⚠️  Failed to clear emergency:`, err.message);
+            console.log('🧹 Clearing active emergencies...');
+            try {
+                for (const intersectionId of Object.keys(intersections)) {
+                    const result = await globalContract.evaluateTransaction('GetActiveEmergencies', intersectionId);
+                    const emergencies = JSON.parse(result.toString());
+                    
+                    for (const emergency of emergencies) {
+                        try {
+                            const emergencyKey = emergency.Key || emergency.key || emergency;
+                            await globalContract.submitTransaction('ClearEmergencyRequest', emergencyKey);
+                            console.log(`✅ Cleared emergency: ${emergencyKey}`);
+                        } catch (err) {
+                            console.error(`⚠️  Failed to clear emergency:`, err.message);
+                        }
                     }
                 }
+                console.log('✅ All emergencies cleared');
+            } catch (error) {
+                console.error('⚠️  Emergency cleanup failed:', error.message);
             }
-            console.log('✅ All emergencies cleared');
-        } catch (error) {
-            console.error('⚠️  Emergency cleanup failed:', error.message);
-        }
-        
-        wss.close();
+            
+            wss.close();
             delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
             if (globalGateway) {
                 globalGateway.disconnect();
@@ -410,7 +410,6 @@ server.listen(PORT, async () => {
         process.exit(1);
     }
 });
-
 
 // Helper function to update intersection state from blockchain
 async function updateIntersectionState(intersectionId) {
@@ -484,7 +483,7 @@ app.post('/api/emergency/:intersectionId', async (req, res) => {
         await globalContract.submitTransaction('ComputeDecision', intersectionId);
         await updateIntersectionState(intersectionId);
         
-        // Force immediate state change (don't wait for state machine)
+        // Force immediate state change
         if (intersections[intersectionId] && intersections[intersectionId].decision) {
             const decision = intersections[intersectionId].decision;
             if (decision.isEmergency) {
@@ -498,7 +497,6 @@ app.post('/api/emergency/:intersectionId', async (req, res) => {
                 intersections[intersectionId].inTransition = false;
                 intersections[intersectionId].emergencyOverride = true;
                 
-                // Broadcast immediately
                 broadcastState();
             }
         }
